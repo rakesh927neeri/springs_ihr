@@ -1,0 +1,286 @@
+var springs = ee.FeatureCollection("projects/ee-cgodavariclimate/assets/springs"),
+
+    //Springsheds spatial distribution modeling, using classifiers
+
+    //var region = ee.Geometry.Rectangle({coords:[75.4,33.1,76.0,33.7]});
+    var region = ee.Geometry.Rectangle({coords:[74.8,32.82,76.63,34.23]});
+    print(region.area().divide(1e6),'region area in km2');
+
+    Map.centerObject(region);
+    Map.addLayer(region,{},'Study area');
+
+    // spring suitability mapping program
+
+    var randomp = ee.FeatureCollection.randomPoints({
+region: region,
+points: 200,
+seed: 3004
+}).map(function(p){return p.set('presence',0)});
+
+var springs = springs.map(function(p){return p.set('presence',1)});
+//print(randomp,'check randomp');
+print(springs,'check springs');
+
+var pa_points = springs.select('presence').merge(randomp);
+
+print(pa_points,'merged');
+
+//load elevation data
+var dem = ee.Image("USGS/SRTMGL1_003").select('elevation').clip(region);
+
+var evi = ee.ImageCollection("MODIS/061/MOD13A2").select('EVI')
+	.filter(ee.Filter.calendarRange(2022,2024,'year'))
+	.reduce(ee.Reducer.mean())
+.clip(region)
+	.multiply(0.0001);
+
+	var sm = ee.ImageCollection("NASA/SMAP/SPL3SMP_E/005").select('soil_moisture_am')
+	.filter(ee.Filter.calendarRange(2022,2023,'year'))
+.reduce(ee.Reducer.mean())
+	.clip(region);
+	//create a predictor raster bands for the classifier,
+	//add rainfall, slope, soil type (categorical variable)
+
+
+	var rain = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD")
+	.filter(ee.Filter.calendarRange(2000,2023,'year'))
+.reduce(ee.Reducer.mean())
+	.clip(region);
+
+	var slope = ee.Terrain.slope(dem);
+
+	//var bd = ee.Image("projects/soilgrids-isric/bdod_mean")
+	//      .select('bdod_0-5cm_mean').clip(region);
+
+	var ksat = ee.ImageCollection("projects/sat-io/open-datasets/HiHydroSoilv2_0/ksat")
+.first()
+	.select('b1').clip(region).multiply(0.00001).rename('ksat');
+
+	//replace NA/masked values with image mean for simplicity
+	var ksat_mean=ksat.reduceRegion({
+geometry: region,
+reducer: ee.Reducer.mode()
+}).get('ksat');
+print(ksat_mean,'ksat mean');
+
+var ksat =ksat.unmask(1.203);
+//replacing with mean, is not proper, replace according to DEM, to be explored later!
+
+
+Map.addLayer(ksat,{max:5.0,min:0.5,palette:['brown','yellow','blue']},'ksat');
+
+var predictors = dem.addBands(evi).addBands(sm).addBands(rain).addBands(slope).addBands(ksat);
+//.addBands(bd);
+print(predictors,'predictors_out');
+
+//to divide the pa_points into training and testing datasets in 80-20 ratio
+var pa_points = pa_points.randomColumn({
+columnName:'random',
+seed:3004,
+distribution:'uniform'
+}); 
+
+//training set
+var pa_points_train = pa_points.filter(ee.Filter.lt('random',0.8));
+var pa_points_test = pa_points.filter(ee.Filter.gte('random',0.2));
+
+//train the model
+var trainingdata = predictors.sampleRegions({
+collection: pa_points_train,
+scale: 30
+})
+print(trainingdata,'training data');
+
+
+//maxent
+var classifier_maxent = ee.Classifier.amnhMaxent({randomTestPoints:30}).train({
+features: trainingdata,
+classProperty: 'presence',
+inputProperties: predictors.bandNames()
+});
+
+var output_maxent = predictors.classify(classifier_maxent);
+print(output_maxent,'maxent output');
+
+//randomforest
+var classifier_rf = ee.Classifier.smileRandomForest(10).setOutputMode('PROBABILITY').train({
+features: trainingdata,
+classProperty: 'presence',
+inputProperties: predictors.bandNames()
+});
+
+var output_rf = predictors.classify(classifier_rf);
+print(output_rf,'rf output');
+
+//cart 
+var classifier_cart = ee.Classifier.smileCart().setOutputMode('PROBABILITY').train({
+features: trainingdata,
+classProperty: 'presence',
+inputProperties: predictors.bandNames()
+});
+
+var output_cart = predictors.classify(classifier_cart);
+print(output_cart,'cart output');
+
+
+
+//svm
+/*
+   var classifier_svm = ee.Classifier.libsvm().setOutputMode('PROBABILITY').train({
+features: trainingdata,
+classProperty: 'presence',
+inputProperties: predictors.bandNames()
+});
+
+var output_svm = predictors.classify(classifier_svm);
+print(output_svm,'svm output');
+
+Map.addLayer(output_svm.select('classification'),{min:0,max:1,palette:['yellow','green','brown']},'output svm');
+ */
+
+
+
+Map.addLayer(output_maxent.select('probability'),{min:0,max:1,palette:['yellow','green','brown']},'ouput maxent');
+Map.addLayer(output_rf.select('classification'),{min:0,max:1,palette:['yellow','green','brown']},'ouput rf');
+Map.addLayer(output_cart.select('classification'),{min:0,max:1,palette:['yellow','green','brown']},'ouput cart');
+
+Map.addLayer(evi,{min:-0.032,max:0.325,palette:['brown','yellow','green']},'EVI map');
+Map.addLayer(slope,{min:0,max:80,palette:['yellow','red']},'Slope map');
+Map.addLayer(rain,{min:6,max:13,palette:['brown','yellow','green']},'Rainfall map');
+Map.addLayer(sm,{min:0,max:1,palette:['brown','yellow','green']},'Soil moisture');
+Map.addLayer(dem,{min:0,max:6500,palette:['blue','yellow','brown']},'DEM layer');
+Map.addLayer(springs,{},'Springs location');
+Map.addLayer(randomp,{color:'green'},'Random points');
+
+
+//accuracy assessment
+print(classifier_maxent.explain(),'maxent output');
+print(classifier_rf.explain(),'rf output');
+print(classifier_cart.explain(),'cart output');
+
+//exprot PREDICTOR data to drive
+Export.image.toDrive({
+image:dem,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'dem',
+scale:100,
+region:region,
+description:'dem',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:evi,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'evi',
+scale:100,
+region:region,
+description:'evi',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:sm,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'sm',
+scale:100,
+region:region,
+description:'sm',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:rain,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'rain',
+scale:100,
+region:region,
+description:'rain',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:slope,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'slope',
+scale:100,
+region:region,
+description:'slope',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:ksat,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'ksat',
+scale:100,
+region:region,
+description:'ksat',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+//export out data to drive
+Export.image.toDrive({
+image:output_cart,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'output_cart',
+scale:100,
+region:region,
+description:'output_cart',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:output_rf,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'output_rf',
+scale:100,
+region:region,
+description:'output_rf',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.image.toDrive({
+image:output_maxent,
+maxPixels:1e13,
+folder:'springs',
+fileNamePrefix:'output_maxent',
+scale:100,
+region:region,
+description:'output_maxent',
+crs:'EPSG:4326',
+fileFormat:'GeoTIFF'
+});
+
+Export.table.toDrive({
+collection:pa_points_train,
+description:'pa_points_train',
+fileNamePrefix:'pa_points_train',
+folder:'springs',
+fileFormat:'SHP'
+});
+
+Export.table.toDrive({
+collection:pa_points_test,
+description:'pa_points_test',
+fileNamePrefix:'pa_points_test',
+folder:'springs',
+fileFormat:'SHP'
+});
+
+
